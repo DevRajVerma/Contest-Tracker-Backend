@@ -1,117 +1,60 @@
-// services/contestFetcher.js
-const axios = require('axios');
-const Contest = require('../models/Contest');
-
-async function fetchCodeforces() {
-  try {
-    const response = await axios.get('https://codeforces.com/api/contest.list');
-    const contests = response.data.result.map(contest => ({
-      name: contest.name,
-      platform: 'Codeforces',
-      url: `https://codeforces.com/contest/${contest.id}`,
-      startTime: new Date(contest.startTimeSeconds * 1000),
-      endTime: new Date((contest.startTimeSeconds + contest.durationSeconds) * 1000),
-      duration: contest.durationSeconds / 60,
-      status: contest.phase === 'BEFORE' ? 'upcoming' : 
-              contest.phase === 'CODING' ? 'ongoing' : 'past'
-    }));
-    return contests;
-  } catch (error) {
-    console.error('Error fetching Codeforces contests:', error);
-    return [];
-  }
-}
-
-async function fetchCodechef() {
-  try {
-    const response = await axios.get('https://www.codechef.com/api/contests');
-    const current = response.data.present.map(contest => ({
-      name: contest.name,
-      platform: 'CodeChef',
-      url: `https://www.codechef.com/${contest.code}`,
-      startTime: new Date(contest.start_date),
-      endTime: new Date(contest.end_date),
-      duration: (new Date(contest.end_date) - new Date(contest.start_date)) / (1000 * 60),
-      status: 'ongoing'
-    }));
-    
-    const upcoming = response.data.future.map(contest => ({
-      name: contest.name,
-      platform: 'CodeChef',
-      url: `https://www.codechef.com/${contest.code}`,
-      startTime: new Date(contest.start_date),
-      endTime: new Date(contest.end_date),
-      duration: (new Date(contest.end_date) - new Date(contest.start_date)) / (1000 * 60),
-      status: 'upcoming'
-    }));
-    
-    const past = response.data.past.map(contest => ({
-      name: contest.name,
-      platform: 'CodeChef',
-      url: `https://www.codechef.com/${contest.code}`,
-      startTime: new Date(contest.start_date),
-      endTime: new Date(contest.end_date),
-      duration: (new Date(contest.end_date) - new Date(contest.start_date)) / (1000 * 60),
-      status: 'past'
-    }));
-    
-    return [...current, ...upcoming, ...past];
-  } catch (error) {
-    console.error('Error fetching CodeChef contests:', error);
-    return [];
-  }
-}
-
-async function fetchLeetcode() {
-  try {
-    const response = await axios.post('https://leetcode.com/graphql', {
-      query: `
-        query {
-          allContests {
-            title
-            titleSlug
-            startTime
-            duration
-            status
-          }
-        }
-      `
-    });
-    
-    const contests = response.data.data.allContests.map(contest => {
-      const startTime = new Date(contest.startTime * 1000);
-      return {
-        name: contest.title,
-        platform: 'LeetCode',
-        url: `https://leetcode.com/contest/${contest.titleSlug}`,
-        startTime,
-        endTime: new Date(startTime.getTime() + contest.duration * 1000),
-        duration: contest.duration / 60,
-        status: contest.status === 'UPCOMING' ? 'upcoming' : 
-                contest.status === 'ONGOING' ? 'ongoing' : 'past'
-      };
-    });
-    
-    return contests;
-  } catch (error) {
-    console.error('Error fetching LeetCode contests:', error);
-    return [];
-  }
-}
+const fetchCodeforces = require('./scrapers/codeforces');
+const scrapeCodechef = require('./scrapers/codechef');
+const scrapeLeetcode = require('./scrapers/leetcode');
+const scrapeAtcoder = require('./scrapers/atcoder');
+const Contest = require('../models/Contest'); // Make sure this path is correct
 
 async function updateContests() {
   try {
-    const [codeforcesContests, codechefContests, leetcodeContests] = await Promise.all([
+    console.log('Starting contest update process...');
+    
+    // Use Promise.allSettled to ensure all requests run even if some fail
+    const results = await Promise.allSettled([
       fetchCodeforces(),
-      fetchCodechef(),
-      fetchLeetcode()
+      scrapeCodechef(),
+      scrapeLeetcode(),
+      scrapeAtcoder()
     ]);
     
-    const allContests = [...codeforcesContests, ...codechefContests, ...leetcodeContests];
+    // Extract results and handle failures
+    const [codeforcesResult, codechefResult, leetcodeResult, atcoderResult] = results;
+    
+    let codeforcesContests = codeforcesResult.status === 'fulfilled' ? codeforcesResult.value : [];
+    let codechefContests = codechefResult.status === 'fulfilled' ? codechefResult.value : [];
+    let leetcodeContests = leetcodeResult.status === 'fulfilled' ? leetcodeResult.value : [];
+    let atcoderContests = atcoderResult.status === 'fulfilled' ? atcoderResult.value : [];
+    
+    // Log individual platform results
+    console.log(`Fetched contests: Codeforces (${codeforcesContests.length}), CodeChef (${codechefContests.length}), LeetCode (${leetcodeContests.length}), AtCoder (${atcoderContests.length})`);
+    
+    // Warnings for empty results
+    if (codeforcesContests.length === 0) console.warn('Failed to fetch Codeforces contests');
+    if (codechefContests.length === 0) console.warn('Failed to fetch CodeChef contests');
+    if (leetcodeContests.length === 0) console.warn('Failed to fetch LeetCode contests');
+    if (atcoderContests.length === 0) console.warn('Failed to fetch AtCoder contests');
+    
+    const allContests = [
+      ...codeforcesContests, 
+      ...codechefContests, 
+      ...leetcodeContests,
+      ...atcoderContests
+    ];
+    
+    if (allContests.length === 0) {
+      console.error('No contests fetched from any platform!');
+      return;
+    }
+    
+    console.log(`Total contests fetched: ${allContests.length}`);
     
     // Update contest status
     const now = new Date();
     allContests.forEach(contest => {
+      if (!contest.startTime || !contest.endTime) {
+        console.warn(`Contest missing time data: ${contest.name} (${contest.platform})`);
+        return;
+      }
+      
       if (contest.startTime > now) {
         contest.status = 'upcoming';
       } else if (contest.endTime > now) {
@@ -122,22 +65,63 @@ async function updateContests() {
     });
     
     // Bulk upsert contests
+    let updatedCount = 0;
+    let errorCount = 0;
+    
     for (const contest of allContests) {
-      await Contest.findOneAndUpdate(
-        { 
-          name: contest.name, 
-          platform: contest.platform,
-          startTime: contest.startTime 
-        },
-        contest,
-        { upsert: true, new: true }
-      );
+      try {
+        // Skip contests with invalid data
+        if (!contest.name || !contest.platform || !contest.startTime || !contest.endTime) {
+          console.warn(`Skipping contest with missing required fields: ${contest.name || 'unnamed'} (${contest.platform || 'unknown platform'})`);
+          continue;
+        }
+        
+        // Ensure dates are valid before inserting
+        if (isNaN(contest.startTime.getTime()) || isNaN(contest.endTime.getTime())) {
+          console.warn(`Skipping contest with invalid dates: ${contest.name} (${contest.platform})`);
+          continue;
+        }
+        
+        await Contest.findOneAndUpdate(
+          { 
+            name: contest.name, 
+            platform: contest.platform,
+            startTime: contest.startTime 
+          },
+          contest,
+          { upsert: true, new: true }
+        );
+        updatedCount++;
+      } catch (err) {
+        console.error(`Error upserting contest ${contest.name} (${contest.platform}):`, err.message);
+        errorCount++;
+      }
     }
     
-    console.log('Contests updated successfully');
+    console.log(`Successfully updated ${updatedCount} out of ${allContests.length} contests (${errorCount} errors)`);
+    
+    // Return stats for potential monitoring
+    return {
+      total: allContests.length,
+      updated: updatedCount,
+      errors: errorCount,
+      platforms: {
+        codeforces: codeforcesContests.length,
+        codechef: codechefContests.length,
+        leetcode: leetcodeContests.length,
+        atcoder: atcoderContests.length
+      }
+    };
   } catch (error) {
-    console.error('Error updating contests:', error);
+    console.error('Error in updateContests:', error.message);
+    throw error; // Let the caller handle the error
   }
 }
 
-module.exports = { updateContests };
+module.exports = { 
+  updateContests,
+  fetchCodeforces,
+  scrapeCodechef,
+  scrapeLeetcode,
+  scrapeAtcoder
+};
